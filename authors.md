@@ -9,7 +9,7 @@
 ## Citation
 
 Source:
-[`DESCRIPTION`](https://github.com/ixpantia/tapLock/blob/main/DESCRIPTION)
+[`DESCRIPTION`](https://github.com/ixpantia/tapLock/blob/v0.1.0/DESCRIPTION)
 
 Quintero A (2026). *tapLock: Seamless Single Sign-on for 'shiny'*. R
 package version 0.2.0, <https://github.com/ixpantia/tapLock>.

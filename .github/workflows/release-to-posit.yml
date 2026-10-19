@@ -1,0 +1,73 @@
+name: Publica parquete R a Posit Package Manager ubuntu 24.04
+
+on:
+  release:
+    types: [published]
+
+env:
+  RSPM_URL: "https://pm.ixpantia.org"
+  R_VERSION: "4.6.0"
+
+jobs:
+  build-and-publish:
+    name: Contruye & Publica (Ubuntu 24.04 Noble)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Descarga codigo fuente del repositorio 
+        uses: actions/checkout@v4
+
+      - name: Preparar Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Configurar R en el entorno
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: ${{ env.R_VERSION }}
+
+      - name: Instalación de librerías del sistema base
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            build-essential \
+            libuv1-dev \
+            libssl-dev \
+            libcurl4-openssl-dev \
+            libxml2-dev \
+            git \
+            curl
+      
+      - name: Instalar dependencias de R listadas en DESCRIPTION
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          extra-packages: any::rcmdcheck
+
+      - name: Construir el Paquete Fuente
+        run: |
+          R CMD build --no-build-vignettes .
+          # Detecta dinámicamente cualquier .tar.gz generado que NO sea el binario
+          SRC_TAR=$(ls *.tar.gz | grep -v "_R_" | head -n 1)
+          echo "PKG_SRC=$SRC_TAR" >> $GITHUB_ENV
+          echo "Paquete fuente generado: $SRC_TAR"
+
+      - name: Compilar el Paquete Binario para Ubuntu 24.04
+        run: |
+          mkdir -p /tmp/rlib
+          R CMD INSTALL -l /tmp/rlib --build ${{ env.PKG_SRC }}
+          rm -rf /tmp/rlib
+
+          # Detecta dinámicamente el binario generado por R CMD INSTALL
+          BIN_TAR=$(ls *_R_*.tar.gz | head -n 1)
+          echo "PKG_BIN=$BIN_TAR" >> $GITHUB_ENV
+          echo "Paquete binario generado: $BIN_TAR"
+
+      - name: Instalar el CLI de rspm y Publicar en Posit Package Manager
+        env:
+          RSPM_API_KEY: ${{ secrets.RSPM_API_KEY }}
+        run: |
+          # Instalar CLI de rspm
+          curl -sL https://cdn.posit.co/rspm/installer/rspm-cli.sh | bash
+
+          # Publicar paquete fuente en la fuente 'github-ix'
+          rspm add --source=github-ix --path=${{ env.PKG_SRC }}
+
+          # Publicar paquete binario precompilado asociándolo a la distribución 'noble'
+          rspm add binary --source=github-ix --distribution=noble --path=${{ env.PKG_BIN }}

@@ -7,7 +7,7 @@ on:
 
 env:
   PACKAGEMANAGER_ADDRESS: "https://pm.ixpantia.org"
-  RSPM_SERVER_VERSION: "2025.04.0-4"
+  RSPM_SERVER_VERSION: "2026.09.0" # Versión REAL del servidor pm.ixpantia.org (consultada via /__api__/status)
   R_VERSION: "4.6.0"
 
 jobs:

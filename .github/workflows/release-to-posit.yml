@@ -1,16 +1,18 @@
-name: Publica parquete R a Posit Package Manager ubuntu 24.04
+name: Publica paquete R a Posit Package Manager ubuntu 24.04
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 env:
-  RSPM_URL: "https://pm.ixpantia.org"
+  PACKAGEMANAGER_ADDRESS: "https://pm.ixpantia.org"
+  RSPM_SERVER_VERSION: "2025.04.0-4"
   R_VERSION: "4.6.0"
 
 jobs:
   build-and-publish:
-    name: Contruye & Publica (Ubuntu 24.04 Noble)
+    name: Construye & Publica (Ubuntu 24.04 Noble)
     runs-on: ubuntu-24.04
     steps:
       - name: Descarga codigo fuente del repositorio 
@@ -61,13 +63,18 @@ jobs:
 
       - name: Instalar el CLI de rspm y Publicar en Posit Package Manager
         env:
-          RSPM_API_KEY: ${{ secrets.RSPM_API_KEY }}
+          PACKAGEMANAGER_TOKEN: ${{ secrets.PACKAGEMANAGER_TOKEN }}
         run: |
-          # Instalar CLI de rspm
-          curl -sL https://cdn.posit.co/rspm/installer/rspm-cli.sh | bash
+          # Instalar CLI de rspm (la versión del CLI debe coincidir con la del servidor)
+          curl -f --retry 3 -o rspm \
+            "https://cdn.posit.co/package-manager/linux/amd64/rspm-cli-linux-${RSPM_SERVER_VERSION}"
+          chmod +x rspm
+
+          # Probar conectividad con el servidor
+          ./rspm verify
 
           # Publicar paquete fuente en la fuente 'github-ix'
-          rspm add --source=github-ix --path=${{ env.PKG_SRC }}
+          ./rspm add --source=github-ix --path=${{ env.PKG_SRC }}
 
           # Publicar paquete binario precompilado asociándolo a la distribución 'noble'
-          rspm add binary --source=github-ix --distribution=noble --path=${{ env.PKG_BIN }}
+          ./rspm add binary --source=github-ix --distribution=noble --path=${{ env.PKG_BIN }}

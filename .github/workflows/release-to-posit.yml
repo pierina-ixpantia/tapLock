@@ -150,6 +150,10 @@ jobs:
             distribution: rhel10
     container:
       image: ${{ matrix.image }}
+      # Algunas imágenes (Rocky/RHEL) no definen PATH en su configuración y el
+      # runner lo pierde cuando un paso modifica GITHUB_PATH ("bash: not found").
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
       # En contenedores se ejecuta como root, por eso no se usa sudo
       - name: Instalación de librerías del sistema base (apt - Ubuntu/Debian)
@@ -223,8 +227,21 @@ jobs:
           fi
           Rscript -e 'cat(R.version.string, "\n")'
 
-      - name: Preparar Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # Rust se instala a mano (en lugar de dtolnay/rust-toolchain) porque ese
+      # action modifica GITHUB_PATH y rompe el PATH en estos contenedores. Se
+      # usan rutas fijas y enlaces en /usr/local/bin, igual que con R.
+      - name: Instalar Rust (rustup)
+        run: |
+          export CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup
+          curl --proto '=https' --tlsv1.2 -sSf --retry 3 https://sh.rustup.rs \
+            | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+          for bin in cargo rustc rustup rustdoc; do
+            ln -sf "/opt/cargo/bin/$bin" "/usr/local/bin/$bin"
+          done
+          echo "CARGO_HOME=/opt/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=/opt/rustup" >> "$GITHUB_ENV"
+          cargo --version
+          rustc --version
 
       - name: Instalar dependencias de R listadas en DESCRIPTION
         uses: r-lib/actions/setup-r-dependencies@v2

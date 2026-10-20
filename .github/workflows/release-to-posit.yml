@@ -7,10 +7,12 @@ on:
 
 env:
   PACKAGEMANAGER_ADDRESS: "https://pm.ixpantia.org"
-  RSPM_SERVER_VERSION: "2026.09.0" 
+  RSPM_SERVER_VERSION: "2026.09.0" # Versión REAL del servidor pm.ixpantia.org (consultada via /__api__/status)
+  R_VERSION: "4.6.0"
 
 jobs:
-  # Job 1: publica el paquete FUENTE una única vez. 
+  # Job 1: publica el paquete FUENTE una única vez. En Posit Package Manager la
+  # versión del paquete debe existir en la fuente antes de poder asociar binarios.
   publicar-fuente:
     name: Construye & Publica paquete fuente (Ubuntu 24.04)
     runs-on: ubuntu-24.04
@@ -20,11 +22,6 @@ jobs:
 
       - name: Preparar Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Configurar R en el entorno
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: ${{ env.R_VERSION }}
 
       - name: Instalación de librerías del sistema base
         run: |
@@ -37,6 +34,25 @@ jobs:
             git \
             curl
       
+      # R se instala directamente del CDN de Posit (mismo canal y versión que
+      # los jobs de binarios) en lugar de r-lib/actions/setup-r, que resuelve
+      # la versión vía api.r-hub.io y falla sin reintentos si recibe un 404
+      # (p. ej., cuando la versión llega vacía al action). Con esto, el job de
+      # fuente usa exactamente la misma versión de R que los binarios publicados.
+      - name: Instalar R desde el CDN de Posit (Ubuntu 24.04)
+        run: |
+          curl -fL --retry 3 -o /tmp/r-install.deb \
+            "https://cdn.posit.co/r/ubuntu-2404/pkgs/r-${R_VERSION}_1_amd64.deb"
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/r-install.deb
+          rm -f /tmp/r-install.deb
+          # Los builds de Posit se instalan en /opt/R/<versión>; si el .deb no
+          # dejó R en el PATH, se enlazan los binarios (igual que hace setup-r)
+          if ! command -v R >/dev/null 2>&1; then
+            sudo ln -sf "/opt/R/${R_VERSION}/bin/R" /usr/local/bin/R
+            sudo ln -sf "/opt/R/${R_VERSION}/bin/Rscript" /usr/local/bin/Rscript
+          fi
+          Rscript -e 'cat(R.version.string, "\n")'
+
       - name: Instalar dependencias de R listadas en DESCRIPTION
         uses: r-lib/actions/setup-r-dependencies@v2
         with:
@@ -63,10 +79,21 @@ jobs:
           ./rspm verify
 
           # Publicar paquete fuente en la fuente 'github-ix'.
-          # --succeed-on-existing: si la versión ya fue publicada no es un error;
-          # esto permite re-ejecutar el workflow para agregar binarios de otras
-          # distribuciones sin que el job de fuente falle ni bloquee a los binarios.
-          ./rspm add --source=github-ix --path=${{ env.PKG_SRC }} --succeed-on-existing
+          # --succeed-on-existing: si el paquete ya existe, el CLI no retorna error.
+          # Además, si el SERVIDOR rechaza la publicación porque la versión es
+          # idéntica a la ya existente ("is identical to an existing package",
+          # error que el CLI no tolera por sí solo), se tolera manualmente:
+          # permite re-ejecutar el workflow para agregar binarios de otras
+          # distribuciones sin que el job de fuente falle y los salte.
+          if ! OUT=$(./rspm add --source=github-ix --path=${{ env.PKG_SRC }} --succeed-on-existing 2>&1); then
+            echo "$OUT"
+            if echo "$OUT" | grep -qiE 'already exists|identical to an existing'; then
+              echo "::warning::La versión del paquete ya existe en 'github-ix'; se continúa con la publicación de binarios."
+              exit 0
+            fi
+            exit 1
+          fi
+          echo "$OUT"
 
   # Job 2: compila y publica el binario precompilado por distribución.
   # Cada entrada corre en un contenedor de la distro objetivo y publica el
@@ -197,7 +224,15 @@ jobs:
           ./rspm verify
 
           # Publicar paquete binario precompilado asociándolo a la distribución
-          # de la matriz. --succeed-on-existing: re-publicar un binario que ya
-          # existe no es un error (backfill de binarios por distro sin cambiar
-          # la versión del paquete).
-          ./rspm add binary --source=github-ix --distribution=${{ matrix.distribution }} --path=${{ env.PKG_BIN }} --succeed-on-existing
+          # de la matriz. Igual que en el job de fuente: si el binario ya existe
+          # (en el CLI o en el servidor), se tolera para permitir el backfill
+          # de binarios por distribución sin cambiar la versión del paquete.
+          if ! OUT=$(./rspm add binary --source=github-ix --distribution=${{ matrix.distribution }} --path=${{ env.PKG_BIN }} --succeed-on-existing 2>&1); then
+            echo "$OUT"
+            if echo "$OUT" | grep -qiE 'already exists|identical to an existing'; then
+              echo "::warning::El binario para ${{ matrix.distribution }} ya existe; no se vuelve a publicar."
+              exit 0
+            fi
+            exit 1
+          fi
+          echo "$OUT"

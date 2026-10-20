@@ -5,19 +5,36 @@ on:
     types: [published]
   workflow_dispatch:
 
+# Evita ejecuciones simultáneas para el mismo ref (dos publicaciones a la vez
+# sobre el mismo paquete pueden chocar en el servidor).
+concurrency:
+  group: publicar-ppm-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 env:
   PACKAGEMANAGER_ADDRESS: "https://pm.ixpantia.org"
-  RSPM_SERVER_VERSION: "2026.09.0" # Versión REAL del servidor pm.ixpantia.org (consultada via /__api__/status)
+  RSPM_SERVER_VERSION: "2026.09.0" # Versión REAL del servidor (consultada via /__api__/status)
   R_VERSION: "4.6.0"
+  # Los requisitos de sistema se instalan explícitamente en cada job; se evita
+  # que pak intente instalarlos por su cuenta (en RHEL ejecuta
+  # `subscription-manager`, que no funciona en contenedores sin suscripción).
+  # Se definen ambos nombres porque varía según la versión de pak/pkgdepends.
+  R_PKG_SYSREQS: "false"
+  PKG_SYSREQS: "false"
 
 jobs:
-  # Job 1: publica el paquete FUENTE una única vez. En Posit Package Manager la
-  # versión del paquete debe existir en la fuente antes de poder asociar binarios.
+  # Job 1: construye y publica el paquete FUENTE una única vez.
+  # En Posit Package Manager la versión del paquete debe existir en la fuente
+  # antes de poder asociar binarios. El tarball se comparte como artifact para
+  # que todos los binarios se construyan desde exactamente el mismo fuente.
   publicar-fuente:
     name: Construye & Publica paquete fuente (Ubuntu 24.04)
     runs-on: ubuntu-24.04
     steps:
-      - name: Descarga codigo fuente del repositorio 
+      - name: Descarga codigo fuente del repositorio
         uses: actions/checkout@v4
 
       - name: Preparar Rust Toolchain
@@ -27,26 +44,24 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y \
             build-essential \
+            cmake \
+            libicu-dev \
             libuv1-dev \
             libssl-dev \
             libcurl4-openssl-dev \
             libxml2-dev \
+            zlib1g-dev \
             git \
             curl
-      
+
       # R se instala directamente del CDN de Posit (mismo canal y versión que
-      # los jobs de binarios) en lugar de r-lib/actions/setup-r, que resuelve
-      # la versión vía api.r-hub.io y falla sin reintentos si recibe un 404
-      # (p. ej., cuando la versión llega vacía al action). Con esto, el job de
-      # fuente usa exactamente la misma versión de R que los binarios publicados.
+      # los binarios) en lugar de r-lib/actions/setup-r.
       - name: Instalar R desde el CDN de Posit (Ubuntu 24.04)
         run: |
           curl -fL --retry 3 -o /tmp/r-install.deb \
             "https://cdn.posit.co/r/ubuntu-2404/pkgs/r-${R_VERSION}_1_amd64.deb"
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/r-install.deb
           rm -f /tmp/r-install.deb
-          # Los builds de Posit se instalan en /opt/R/<versión>; si el .deb no
-          # dejó R en el PATH, se enlazan los binarios (igual que hace setup-r)
           if ! command -v R >/dev/null 2>&1; then
             sudo ln -sf "/opt/R/${R_VERSION}/bin/R" /usr/local/bin/R
             sudo ln -sf "/opt/R/${R_VERSION}/bin/Rscript" /usr/local/bin/Rscript
@@ -55,22 +70,29 @@ jobs:
 
       - name: Instalar dependencias de R listadas en DESCRIPTION
         uses: r-lib/actions/setup-r-dependencies@v2
-        with:
-          extra-packages: any::rcmdcheck
 
       - name: Construir el Paquete Fuente
         run: |
           R CMD build --no-build-vignettes .
-          # Detecta dinámicamente cualquier .tar.gz generado que NO sea el binario
-          SRC_TAR=$(ls *.tar.gz | grep -v "_R_" | head -n 1)
-          echo "PKG_SRC=$SRC_TAR" >> $GITHUB_ENV
-          echo "Paquete fuente generado: $SRC_TAR"
+          mkdir -p dist
+          SRC_TAR=$(ls *.tar.gz | head -n 1)
+          mv "$SRC_TAR" dist/
+          echo "PKG_SRC=dist/$SRC_TAR" >> "$GITHUB_ENV"
+          echo "Paquete fuente generado: dist/$SRC_TAR"
+
+      - name: Guardar el paquete fuente como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paquete-fuente
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Instalar el CLI de rspm y Publicar paquete fuente en Posit Package Manager
         env:
           PACKAGEMANAGER_TOKEN: ${{ secrets.PACKAGEMANAGER_TOKEN }}
         run: |
-          # Instalar CLI de rspm (la versión del CLI debe coincidir con la del servidor)
+          # La versión del CLI debe coincidir con la del servidor
           curl -f --retry 3 -o rspm \
             "https://cdn.posit.co/package-manager/linux/amd64/rspm-cli-linux-${RSPM_SERVER_VERSION}"
           chmod +x rspm
@@ -78,14 +100,11 @@ jobs:
           # Probar conectividad con el servidor
           ./rspm verify
 
-          # Publicar paquete fuente en la fuente 'github-ix'.
-          # --succeed-on-existing: si el paquete ya existe, el CLI no retorna error.
-          # Además, si el SERVIDOR rechaza la publicación porque la versión es
-          # idéntica a la ya existente ("is identical to an existing package",
-          # error que el CLI no tolera por sí solo), se tolera manualmente:
-          # permite re-ejecutar el workflow para agregar binarios de otras
-          # distribuciones sin que el job de fuente falle y los salte.
-          if ! OUT=$(./rspm add --source=github-ix --path=${{ env.PKG_SRC }} --succeed-on-existing 2>&1); then
+          # --succeed-on-existing no cubre el caso "is identical to an existing
+          # package" que devuelve el servidor, así que se tolera manualmente.
+          # Esto permite re-ejecutar el workflow para agregar binarios de otras
+          # distribuciones sin que el job de fuente falle.
+          if ! OUT=$(./rspm add --source=github-ix --path="${PKG_SRC}" --succeed-on-existing 2>&1); then
             echo "$OUT"
             if echo "$OUT" | grep -qiE 'already exists|identical to an existing'; then
               echo "::warning::La versión del paquete ya existe en 'github-ix'; se continúa con la publicación de binarios."
@@ -96,8 +115,7 @@ jobs:
           echo "$OUT"
 
   # Job 2: compila y publica el binario precompilado por distribución.
-  # Cada entrada corre en un contenedor de la distro objetivo y publica el
-  # binario asociándolo a la distribución correspondiente del servidor PPM.
+  # Cada entrada corre en un contenedor de la distro objetivo.
   publicar-binarios:
     name: Construye & Publica binario (${{ matrix.label }})
     needs: publicar-fuente
@@ -106,41 +124,38 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Nota: la versión de R de cada r_url debe coincidir con env.R_VERSION
           - label: "Ubuntu 24.04 (noble)"
             image: ubuntu:24.04
             pkg_mgr: apt
-            r_url: "https://cdn.posit.co/r/ubuntu-2404/pkgs/r-4.6.0_1_amd64.deb"
+            posit_os: ubuntu-2404
             distribution: noble
-          # Debian 13 (trixie): es la distribución Debian que ofrece el servidor
-          # PPM actual (Debian 12/bookworm ya no aparece). URL de R verificado
-          # via https://api.r-hub.io/rversions/resolve/4.6.0/linux-debian-13/x86_64
+          # Debian 13 (trixie) es la distribución Debian que ofrece el servidor PPM actual.
           - label: "Debian 13 (trixie)"
             image: debian:13
             pkg_mgr: apt
-            r_url: "https://cdn.posit.co/r/debian-13/pkgs/r-4.6.0_1_amd64.deb"
+            posit_os: debian-13
             distribution: trixie
+          # RHEL 9/10 se construyen sobre Rocky Linux: es binariamente compatible
+          # con RHEL, no requiere suscripción y trae los repos CRB/EPEL. Los
+          # binarios se publican con la distribución rhel9/rhel10 del servidor.
           - label: "RHEL 9"
-            image: redhat/ubi9
+            image: rockylinux/rockylinux:9
             pkg_mgr: dnf
-            r_url: "https://cdn.posit.co/r/rhel-9/pkgs/R-4.6.0-1-1.x86_64.rpm"
+            posit_os: rhel-9
             distribution: rhel9
           - label: "RHEL 10"
-            image: redhat/ubi10
+            image: rockylinux/rockylinux:10
             pkg_mgr: dnf
-            r_url: "https://cdn.posit.co/r/rhel-10/pkgs/R-4.6.0-1-1.x86_64.rpm"
+            posit_os: rhel-10
             distribution: rhel10
     container:
       image: ${{ matrix.image }}
     steps:
-      - name: Descarga codigo fuente del repositorio
-        uses: actions/checkout@v4
-
       # En contenedores se ejecuta como root, por eso no se usa sudo
       - name: Instalación de librerías del sistema base (apt - Ubuntu/Debian)
         if: matrix.pkg_mgr == 'apt'
         run: |
-          DEBIAN_FRONTEND=noninteractive apt-get update && \
+          DEBIAN_FRONTEND=noninteractive apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential \
             cmake \
@@ -154,29 +169,21 @@ jobs:
             curl \
             ca-certificates
 
-      # La auto-instalación de requisitos de sistema de pak está desactivada
-      # (R_PKG_SYSREQS=false en setup-r-dependencias), por lo que esta lista
-      # debe cubrir TODO lo que necesitan los 58 paquetes del lockfile:
-      #   cmake         - fs (compila el libuv embebido del tarball; libuv-devel
-      #                   no existe en los repos UBI de RHEL 9 y `later`/httpuv
-      #                   traen el suyo propio)
-      #   libicu-devel  - stringi
-      #   zlib-devel    - httpuv
-      #   openssl-devel, libcurl-devel, libxml2-devel - curl, xml2, tapLock
-      # Sin `curl`: las imágenes UBI traen `curl-minimal`, que entra en
-      # conflicto con el paquete `curl` completo (error de transacción dnf).
-      # El binario /usr/bin/curl lo provee igualmente curl-minimal (HTTPS ok),
-      # suficiente para descargar el CLI de rspm más adelante.
-      # `xz`: el Makevars generado por rextendr descomprime rust/vendor.tar.xz
-      # y las imágenes mínimas de UBI no traen el binario xz (fallaba en RHEL 10).
+      # Se habilitan CRB (libuv-devel y otros -devel) y EPEL (dependencias de R).
+      # Sin `curl`: la imagen trae `curl-minimal`, que entra en conflicto con
+      # el paquete `curl` completo; el binario /usr/bin/curl ya está disponible.
+      # `xz`: rextendr descomprime rust/vendor.tar.xz y la imagen mínima no lo trae.
       - name: Instalación de librerías del sistema base (dnf - RHEL)
         if: matrix.pkg_mgr == 'dnf'
         run: |
+          dnf install -y dnf-plugins-core epel-release
+          dnf config-manager --set-enabled crb
           dnf install -y \
             gcc-c++ \
             make \
             cmake \
             libicu-devel \
+            libuv-devel \
             zlib-devel \
             openssl-devel \
             libcurl-devel \
@@ -187,20 +194,25 @@ jobs:
             gzip \
             xz
 
+      # Git ya está instalado: checkout obtiene un clon real en lugar del tarball.
+      - name: Descarga codigo fuente del repositorio
+        uses: actions/checkout@v4
+
       - name: Instalar R desde el CDN de Posit (apt - Ubuntu/Debian)
         if: matrix.pkg_mgr == 'apt'
         run: |
-          curl -fsSL --retry 3 -o /tmp/r-install.deb "${{ matrix.r_url }}"
+          curl -fsSL --retry 3 -o /tmp/r-install.deb \
+            "https://cdn.posit.co/r/${{ matrix.posit_os }}/pkgs/r-${R_VERSION}_1_amd64.deb"
           DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/r-install.deb
           rm -f /tmp/r-install.deb
 
       - name: Instalar R desde el CDN de Posit (dnf - RHEL)
         if: matrix.pkg_mgr == 'dnf'
         run: |
-          dnf install -y "${{ matrix.r_url }}"
+          dnf install -y \
+            "https://cdn.posit.co/r/${{ matrix.posit_os }}/pkgs/R-${R_VERSION}-1-1.x86_64.rpm"
 
-      # Los builds de R de Posit se instalan en /opt/R/<versión>; si el paquete
-      # no deja R en el PATH, se enlazan los binarios (igual que hace setup-r)
+      # Los builds de R de Posit se instalan en /opt/R/<versión>
       - name: Enlazar R al PATH
         run: |
           if ! command -v R >/dev/null 2>&1; then
@@ -214,51 +226,41 @@ jobs:
 
       - name: Instalar dependencias de R listadas en DESCRIPTION
         uses: r-lib/actions/setup-r-dependencies@v2
-        # pak intenta instalar él mismo los requisitos de sistema; en RHEL su
-        # receta ejecuta `subscription-manager repos --enable codeready-builder
-        # for-rhel-9-...`, que falla en los contenedores UBI (sin suscripción:
-        # "This system has no repositories available through subscriptions") y
-        # mata el job con "error in pak subprocess". Se desactiva y los
-        # requisitos los instala explícitamente el paso de dnf/apt de arriba.
-        env:
-          R_PKG_SYSREQS: "false"
 
-      - name: Construir el Paquete Fuente
-        run: |
-          R CMD build --no-build-vignettes .
-          # Detecta dinámicamente cualquier .tar.gz generado que NO sea el binario
-          SRC_TAR=$(ls *.tar.gz | grep -v "_R_" | head -n 1)
-          echo "PKG_SRC=$SRC_TAR" >> $GITHUB_ENV
-          echo "Paquete fuente generado: $SRC_TAR"
+      # Se reutiliza el mismo tarball fuente que se publicó en el job 1
+      - name: Descargar el paquete fuente
+        uses: actions/download-artifact@v4
+        with:
+          name: paquete-fuente
+          path: dist
 
       - name: Compilar el Paquete Binario para ${{ matrix.label }}
         run: |
+          PKG_SRC=$(ls dist/*.tar.gz | head -n 1)
+          echo "Compilando desde: $PKG_SRC"
+
           mkdir -p /tmp/rlib
-          R CMD INSTALL -l /tmp/rlib --build ${{ env.PKG_SRC }}
+          R CMD INSTALL -l /tmp/rlib --build "$PKG_SRC"
           rm -rf /tmp/rlib
 
-          # Detecta dinámicamente el binario generado por R CMD INSTALL
+          # R CMD INSTALL --build deja el binario en el directorio actual
           BIN_TAR=$(ls *_R_*.tar.gz | head -n 1)
-          echo "PKG_BIN=$BIN_TAR" >> $GITHUB_ENV
+          echo "PKG_BIN=$BIN_TAR" >> "$GITHUB_ENV"
           echo "Paquete binario generado: $BIN_TAR"
 
       - name: Instalar el CLI de rspm y Publicar el binario en Posit Package Manager
         env:
           PACKAGEMANAGER_TOKEN: ${{ secrets.PACKAGEMANAGER_TOKEN }}
         run: |
-          # Instalar CLI de rspm (la versión del CLI debe coincidir con la del servidor)
           curl -f --retry 3 -o rspm \
             "https://cdn.posit.co/package-manager/linux/amd64/rspm-cli-linux-${RSPM_SERVER_VERSION}"
           chmod +x rspm
 
-          # Probar conectividad con el servidor
           ./rspm verify
 
-          # Publicar paquete binario precompilado asociándolo a la distribución
-          # de la matriz. Igual que en el job de fuente: si el binario ya existe
-          # (en el CLI o en el servidor), se tolera para permitir el backfill
-          # de binarios por distribución sin cambiar la versión del paquete.
-          if ! OUT=$(./rspm add binary --source=github-ix --distribution=${{ matrix.distribution }} --path=${{ env.PKG_BIN }} --succeed-on-existing 2>&1); then
+          # Si el binario ya existe (en el CLI o en el servidor), se tolera
+          # para permitir el backfill de binarios sin cambiar la versión.
+          if ! OUT=$(./rspm add binary --source=github-ix --distribution="${{ matrix.distribution }}" --path="${PKG_BIN}" --succeed-on-existing 2>&1); then
             echo "$OUT"
             if echo "$OUT" | grep -qiE 'already exists|identical to an existing'; then
               echo "::warning::El binario para ${{ matrix.distribution }} ya existe; no se vuelve a publicar."

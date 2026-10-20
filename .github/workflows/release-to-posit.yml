@@ -143,29 +143,41 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get update && \
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential \
+            cmake \
+            libicu-dev \
             libuv1-dev \
             libssl-dev \
             libcurl4-openssl-dev \
             libxml2-dev \
+            zlib1g-dev \
             git \
             curl \
             ca-certificates
 
-      # Sin libuv-devel: no existe en los repos UBI de RHEL 9 (en UBI 10 sí) y
-      # no es necesaria: tapLock usa rustls (no OpenSSL del sistema) y `later`
-      # incluye su propio libuv. Se agrega xz: el Makevars generado por
-      # rextendr descomprime rust/vendor.tar.xz y las imágenes mínimas de UBI
-      # no siempre traen el binario xz (fallaba en RHEL 10).
+      # La auto-instalación de requisitos de sistema de pak está desactivada
+      # (R_PKG_SYSREQS=false en setup-r-dependencias), por lo que esta lista
+      # debe cubrir TODO lo que necesitan los 58 paquetes del lockfile:
+      #   cmake         - fs (compila el libuv embebido del tarball; libuv-devel
+      #                   no existe en los repos UBI de RHEL 9 y `later`/httpuv
+      #                   traen el suyo propio)
+      #   libicu-devel  - stringi
+      #   zlib-devel    - httpuv
+      #   openssl-devel, libcurl-devel, libxml2-devel - curl, xml2, tapLock
       # Sin `curl`: las imágenes UBI traen `curl-minimal`, que entra en
       # conflicto con el paquete `curl` completo (error de transacción dnf).
       # El binario /usr/bin/curl lo provee igualmente curl-minimal (HTTPS ok),
       # suficiente para descargar el CLI de rspm más adelante.
+      # `xz`: el Makevars generado por rextendr descomprime rust/vendor.tar.xz
+      # y las imágenes mínimas de UBI no traen el binario xz (fallaba en RHEL 10).
       - name: Instalación de librerías del sistema base (dnf - RHEL)
         if: matrix.pkg_mgr == 'dnf'
         run: |
           dnf install -y \
             gcc-c++ \
             make \
+            cmake \
+            libicu-devel \
+            zlib-devel \
             openssl-devel \
             libcurl-devel \
             libxml2-devel \
@@ -202,6 +214,14 @@ jobs:
 
       - name: Instalar dependencias de R listadas en DESCRIPTION
         uses: r-lib/actions/setup-r-dependencies@v2
+        # pak intenta instalar él mismo los requisitos de sistema; en RHEL su
+        # receta ejecuta `subscription-manager repos --enable codeready-builder
+        # for-rhel-9-...`, que falla en los contenedores UBI (sin suscripción:
+        # "This system has no repositories available through subscriptions") y
+        # mata el job con "error in pak subprocess". Se desactiva y los
+        # requisitos los instala explícitamente el paso de dnf/apt de arriba.
+        env:
+          R_PKG_SYSREQS: "false"
 
       - name: Construir el Paquete Fuente
         run: |

@@ -112,11 +112,14 @@ jobs:
             pkg_mgr: apt
             r_url: "https://cdn.posit.co/r/ubuntu-2404/pkgs/r-4.6.0_1_amd64.deb"
             distribution: noble
-          - label: "Debian 12 (bookworm)"
-            image: debian:12
+          # Debian 13 (trixie): es la distribución Debian que ofrece el servidor
+          # PPM actual (Debian 12/bookworm ya no aparece). URL de R verificado
+          # via https://api.r-hub.io/rversions/resolve/4.6.0/linux-debian-13/x86_64
+          - label: "Debian 13 (trixie)"
+            image: debian:13
             pkg_mgr: apt
-            r_url: "https://cdn.posit.co/r/debian-12/pkgs/r-4.6.0_1_amd64.deb"
-            distribution: bookworm
+            r_url: "https://cdn.posit.co/r/debian-13/pkgs/r-4.6.0_1_amd64.deb"
+            distribution: trixie
           - label: "RHEL 9"
             image: redhat/ubi9
             pkg_mgr: dnf
@@ -148,13 +151,17 @@ jobs:
             curl \
             ca-certificates
 
+      # Sin libuv-devel: no existe en los repos UBI de RHEL 9 (en UBI 10 sí) y
+      # no es necesaria: tapLock usa rustls (no OpenSSL del sistema) y `later`
+      # incluye su propio libuv. Se agrega xz: el Makevars generado por
+      # rextendr descomprime rust/vendor.tar.xz y las imágenes mínimas de UBI
+      # no siempre traen el binario xz (fallaba en RHEL 10).
       - name: Instalación de librerías del sistema base (dnf - RHEL)
         if: matrix.pkg_mgr == 'dnf'
         run: |
           dnf install -y \
             gcc-c++ \
             make \
-            libuv-devel \
             openssl-devel \
             libcurl-devel \
             libxml2-devel \
@@ -162,7 +169,8 @@ jobs:
             curl \
             ca-certificates \
             tar \
-            gzip
+            gzip \
+            xz
 
       - name: Instalar R desde el CDN de Posit (apt - Ubuntu/Debian)
         if: matrix.pkg_mgr == 'apt'

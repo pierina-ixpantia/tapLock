@@ -1,4 +1,4 @@
-name: Publica paquete R a Posit Package Manager ubuntu 24.04
+name: Publica paquete R a Posit Package Manager (Ubuntu, Debian y RHEL)
 
 on:
   release:
@@ -11,8 +11,10 @@ env:
   R_VERSION: "4.6.0"
 
 jobs:
-  build-and-publish:
-    name: Construye & Publica (Ubuntu 24.04 Noble)
+  # Job 1: publica el paquete FUENTE una única vez. En Posit Package Manager la
+  # versión del paquete debe existir en la fuente antes de poder asociar binarios.
+  publicar-fuente:
+    name: Construye & Publica paquete fuente (Ubuntu 24.04)
     runs-on: ubuntu-24.04
     steps:
       - name: Descarga codigo fuente del repositorio 
@@ -50,18 +52,7 @@ jobs:
           echo "PKG_SRC=$SRC_TAR" >> $GITHUB_ENV
           echo "Paquete fuente generado: $SRC_TAR"
 
-      - name: Compilar el Paquete Binario para Ubuntu 24.04
-        run: |
-          mkdir -p /tmp/rlib
-          R CMD INSTALL -l /tmp/rlib --build ${{ env.PKG_SRC }}
-          rm -rf /tmp/rlib
-
-          # Detecta dinámicamente el binario generado por R CMD INSTALL
-          BIN_TAR=$(ls *_R_*.tar.gz | head -n 1)
-          echo "PKG_BIN=$BIN_TAR" >> $GITHUB_ENV
-          echo "Paquete binario generado: $BIN_TAR"
-
-      - name: Instalar el CLI de rspm y Publicar en Posit Package Manager
+      - name: Instalar el CLI de rspm y Publicar paquete fuente en Posit Package Manager
         env:
           PACKAGEMANAGER_TOKEN: ${{ secrets.PACKAGEMANAGER_TOKEN }}
         run: |
@@ -73,8 +64,142 @@ jobs:
           # Probar conectividad con el servidor
           ./rspm verify
 
-          # Publicar paquete fuente en la fuente 'github-ix'
-          ./rspm add --source=github-ix --path=${{ env.PKG_SRC }}
+          # Publicar paquete fuente en la fuente 'github-ix'.
+          # --succeed-on-existing: si la versión ya fue publicada no es un error;
+          # esto permite re-ejecutar el workflow para agregar binarios de otras
+          # distribuciones sin que el job de fuente falle ni bloquee a los binarios.
+          ./rspm add --source=github-ix --path=${{ env.PKG_SRC }} --succeed-on-existing
 
-          # Publicar paquete binario precompilado asociándolo a la distribución 'noble'
-          ./rspm add binary --source=github-ix --distribution=noble --path=${{ env.PKG_BIN }}
+  # Job 2: compila y publica el binario precompilado por distribución.
+  # Cada entrada corre en un contenedor de la distro objetivo y publica el
+  # binario asociándolo a la distribución correspondiente del servidor PPM.
+  publicar-binarios:
+    name: Construye & Publica binario (${{ matrix.label }})
+    needs: publicar-fuente
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Nota: la versión de R de cada r_url debe coincidir con env.R_VERSION
+          - label: "Ubuntu 24.04 (noble)"
+            image: ubuntu:24.04
+            pkg_mgr: apt
+            r_url: "https://cdn.posit.co/r/ubuntu-2404/pkgs/r-4.6.0_1_amd64.deb"
+            distribution: noble
+          - label: "Debian 12 (bookworm)"
+            image: debian:12
+            pkg_mgr: apt
+            r_url: "https://cdn.posit.co/r/debian-12/pkgs/r-4.6.0_1_amd64.deb"
+            distribution: bookworm
+          - label: "RHEL 9"
+            image: redhat/ubi9
+            pkg_mgr: dnf
+            r_url: "https://cdn.posit.co/r/rhel-9/pkgs/R-4.6.0-1-1.x86_64.rpm"
+            distribution: rhel9
+          - label: "RHEL 10"
+            image: redhat/ubi10
+            pkg_mgr: dnf
+            r_url: "https://cdn.posit.co/r/rhel-10/pkgs/R-4.6.0-1-1.x86_64.rpm"
+            distribution: rhel10
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Descarga codigo fuente del repositorio
+        uses: actions/checkout@v4
+
+      # En contenedores se ejecuta como root, por eso no se usa sudo
+      - name: Instalación de librerías del sistema base (apt - Ubuntu/Debian)
+        if: matrix.pkg_mgr == 'apt'
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get update && \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential \
+            libuv1-dev \
+            libssl-dev \
+            libcurl4-openssl-dev \
+            libxml2-dev \
+            git \
+            curl \
+            ca-certificates
+
+      - name: Instalación de librerías del sistema base (dnf - RHEL)
+        if: matrix.pkg_mgr == 'dnf'
+        run: |
+          dnf install -y \
+            gcc-c++ \
+            make \
+            libuv-devel \
+            openssl-devel \
+            libcurl-devel \
+            libxml2-devel \
+            git \
+            curl \
+            ca-certificates \
+            tar \
+            gzip
+
+      - name: Instalar R desde el CDN de Posit (apt - Ubuntu/Debian)
+        if: matrix.pkg_mgr == 'apt'
+        run: |
+          curl -fsSL --retry 3 -o /tmp/r-install.deb "${{ matrix.r_url }}"
+          DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/r-install.deb
+          rm -f /tmp/r-install.deb
+
+      - name: Instalar R desde el CDN de Posit (dnf - RHEL)
+        if: matrix.pkg_mgr == 'dnf'
+        run: |
+          dnf install -y "${{ matrix.r_url }}"
+
+      # Los builds de R de Posit se instalan en /opt/R/<versión>; si el paquete
+      # no deja R en el PATH, se enlazan los binarios (igual que hace setup-r)
+      - name: Enlazar R al PATH
+        run: |
+          if ! command -v R >/dev/null 2>&1; then
+            ln -sf "/opt/R/${R_VERSION}/bin/R" /usr/local/bin/R
+            ln -sf "/opt/R/${R_VERSION}/bin/Rscript" /usr/local/bin/Rscript
+          fi
+          Rscript -e 'cat(R.version.string, "\n")'
+
+      - name: Preparar Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Instalar dependencias de R listadas en DESCRIPTION
+        uses: r-lib/actions/setup-r-dependencies@v2
+
+      - name: Construir el Paquete Fuente
+        run: |
+          R CMD build --no-build-vignettes .
+          # Detecta dinámicamente cualquier .tar.gz generado que NO sea el binario
+          SRC_TAR=$(ls *.tar.gz | grep -v "_R_" | head -n 1)
+          echo "PKG_SRC=$SRC_TAR" >> $GITHUB_ENV
+          echo "Paquete fuente generado: $SRC_TAR"
+
+      - name: Compilar el Paquete Binario para ${{ matrix.label }}
+        run: |
+          mkdir -p /tmp/rlib
+          R CMD INSTALL -l /tmp/rlib --build ${{ env.PKG_SRC }}
+          rm -rf /tmp/rlib
+
+          # Detecta dinámicamente el binario generado por R CMD INSTALL
+          BIN_TAR=$(ls *_R_*.tar.gz | head -n 1)
+          echo "PKG_BIN=$BIN_TAR" >> $GITHUB_ENV
+          echo "Paquete binario generado: $BIN_TAR"
+
+      - name: Instalar el CLI de rspm y Publicar el binario en Posit Package Manager
+        env:
+          PACKAGEMANAGER_TOKEN: ${{ secrets.PACKAGEMANAGER_TOKEN }}
+        run: |
+          # Instalar CLI de rspm (la versión del CLI debe coincidir con la del servidor)
+          curl -f --retry 3 -o rspm \
+            "https://cdn.posit.co/package-manager/linux/amd64/rspm-cli-linux-${RSPM_SERVER_VERSION}"
+          chmod +x rspm
+
+          # Probar conectividad con el servidor
+          ./rspm verify
+
+          # Publicar paquete binario precompilado asociándolo a la distribución
+          # de la matriz. --succeed-on-existing: re-publicar un binario que ya
+          # existe no es un error (backfill de binarios por distro sin cambiar
+          # la versión del paquete).
+          ./rspm add binary --source=github-ix --distribution=${{ matrix.distribution }} --path=${{ env.PKG_BIN }} --succeed-on-existing

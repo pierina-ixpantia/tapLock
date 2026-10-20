@@ -156,6 +156,10 @@ jobs:
       # incluye su propio libuv. Se agrega xz: el Makevars generado por
       # rextendr descomprime rust/vendor.tar.xz y las imágenes mínimas de UBI
       # no siempre traen el binario xz (fallaba en RHEL 10).
+      # Sin `curl`: las imágenes UBI traen `curl-minimal`, que entra en
+      # conflicto con el paquete `curl` completo (error de transacción dnf).
+      # El binario /usr/bin/curl lo provee igualmente curl-minimal (HTTPS ok),
+      # suficiente para descargar el CLI de rspm más adelante.
       - name: Instalación de librerías del sistema base (dnf - RHEL)
         if: matrix.pkg_mgr == 'dnf'
         run: |
@@ -166,7 +170,6 @@ jobs:
             libcurl-devel \
             libxml2-devel \
             git \
-            curl \
             ca-certificates \
             tar \
             gzip \

@@ -157,6 +157,7 @@ jobs:
         run: |
           DEBIAN_FRONTEND=noninteractive apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bash \
             build-essential \
             cmake \
             libicu-dev \
@@ -179,6 +180,7 @@ jobs:
           dnf install -y dnf-plugins-core epel-release
           dnf config-manager --set-enabled crb
           dnf install -y \
+            bash \
             gcc-c++ \
             make \
             cmake \
